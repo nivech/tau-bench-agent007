@@ -42,3 +42,5 @@ Use the login node for git operations and environment setup.
 Use Slurm compute nodes for τ-bench runs, evaluations, and any GPU workloads.
 
 Save the file. Do **not** run anything from it.
+
+For vLLM-hosted models, use `--platform vllm-chat` and pass the full OpenAI-compatible endpoint via `--base-url` (e.g., http://localhost:8000/v1). τ-bench does not start vLLM servers; they must be running beforehand.

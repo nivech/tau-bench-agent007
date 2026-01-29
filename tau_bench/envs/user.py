@@ -115,12 +115,18 @@ User Response:
 <the user response (this will be parsed and sent to the agent)>"""
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
-        res = completion(
-            model=self.model, custom_llm_provider=self.provider, messages=messages
-        )
+    api_base = os.getenv('USER_MODEL_API_BASE', None)
+    res = completion(
+        model=self.model, 
+        custom_llm_provider=self.provider, 
+        messages=messages,
+        api_base=api_base
+    )
+
         message = res.choices[0].message
         self.messages.append(message.model_dump())
-        self.total_cost = res._hidden_params["response_cost"]
+        self.total_cost = res._hidden_params.get("response_cost", 0.0) 
+        if hasattr(res, "_hidden_params") else 0.0
         return self.parse_response(message.content)
 
     def reset(self, instruction: Optional[str] = None) -> str:
