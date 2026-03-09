@@ -92,7 +92,7 @@ def _check_subject_resolution(domain: str, action: Action, task_state: TaskState
         if val is not None and isinstance(val, str) and val.strip() and val not in known_ids:
             return _block(
                 CODE_SUBJECT_AMBIGUITY,
-                "Resolve the target entity (account owner, saved entity, or newly introduced entity) before proceeding.",
+                "Resolve the target entity before taking this action.",
                 [param],
             )
     if domain == "retail" and action.name in _RETAIL_SUBJECT_TOOLS:
@@ -104,7 +104,7 @@ def _check_subject_resolution(domain: str, action: Action, task_state: TaskState
         if val is not None and isinstance(val, str) and val.strip() and val not in known_ids:
             return _block(
                 CODE_SUBJECT_AMBIGUITY,
-                "Resolve the target entity (account owner, saved entity, or newly introduced entity) before proceeding.",
+                "Resolve the target entity before taking this action.",
                 [param],
             )
     return None

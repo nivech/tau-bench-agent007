@@ -27,6 +27,12 @@ def test_recovery_state_defaults():
     assert state.pending_since_step == 0
     assert state.recovery_count_this_run == 0
     assert state.last_blocked_retry_key is None
+    assert state.awaiting_user_input is False
+    assert state.retry_action_after_confirmation is None
+    assert state.blocked_goal_action is None
+    assert state.missing_prerequisites == []
+    assert state.resume_intent_after_prereq is False
+    assert state.retry_action_after_prereq is None
 
 
 def test_decide_recovery_validation_error_returns_replan():
@@ -74,8 +80,8 @@ def test_decide_recovery_policy_block_missing_confirmation_returns_ask_user_conf
     assert decision.retry_allowed is True
 
 
-def test_decide_recovery_policy_block_missing_user_id_returns_replan():
-    """For policy_block with missing_user_id (not confirmation), returns REPLAN_FROM_STATE."""
+def test_decide_recovery_policy_block_missing_user_id_returns_satisfy_prerequisite():
+    """For policy_block with missing_user_id + side-effecting action, returns SATISFY_PREREQUISITE with blocked intent."""
     action = Action(name="book_reservation", kwargs={"user_id": "u1"})
     rec_input = RecoveryInput(
         failure_type=FailureCategory.policy_block.value,
@@ -89,7 +95,52 @@ def test_decide_recovery_policy_block_missing_user_id_returns_replan():
     )
     config = default_recovery_config("airline")
     decision = decide_recovery(rec_input, config)
-    assert decision.proposed_strategy == RecoveryStrategy.REPLAN_FROM_STATE.value
+    assert decision.proposed_strategy == RecoveryStrategy.SATISFY_PREREQUISITE.value
+    assert decision.state_updates.get("blocked_goal_action") == action
+    assert decision.state_updates.get("missing_prerequisites") == ["user_id"]
+    assert decision.state_updates.get("resume_intent_after_prereq") is True
+    assert "user_id" in (decision.replanning_hint or "")
+
+
+def test_decide_recovery_policy_block_missing_profile_grounding_returns_satisfy_prerequisite():
+    """For policy_block with missing_profile_grounding + side-effecting action, returns SATISFY_PREREQUISITE."""
+    action = Action(name="book_reservation", kwargs={"user_id": "u1"})
+    rec_input = RecoveryInput(
+        failure_type=FailureCategory.policy_block.value,
+        action=action,
+        step_index=2,
+        max_num_steps=30,
+        source_code="missing_profile_grounding",
+        source_message="profile must be grounded before booking",
+        missing_prerequisites=["profile_grounded"],
+        domain="airline",
+    )
+    config = default_recovery_config("airline")
+    decision = decide_recovery(rec_input, config)
+    assert decision.proposed_strategy == RecoveryStrategy.SATISFY_PREREQUISITE.value
+    assert decision.state_updates.get("blocked_goal_action") == action
+    assert decision.state_updates.get("missing_prerequisites") == ["profile_grounded"]
+    assert "profile_grounded" in (decision.replanning_hint or "") or "prerequisite" in (decision.replanning_hint or "").lower()
+
+
+def test_decide_recovery_policy_block_not_authenticated_returns_satisfy_prerequisite():
+    """For policy_block with not_authenticated (retail) + side-effecting action, returns SATISFY_PREREQUISITE."""
+    action = Action(name="cancel_pending_order", kwargs={"order_id": "O1"})
+    rec_input = RecoveryInput(
+        failure_type=FailureCategory.policy_block.value,
+        action=action,
+        step_index=2,
+        max_num_steps=30,
+        source_code="not_authenticated",
+        source_message="user must be authenticated",
+        missing_prerequisites=["authenticated"],
+        domain="retail",
+    )
+    config = default_recovery_config("retail")
+    decision = decide_recovery(rec_input, config)
+    assert decision.proposed_strategy == RecoveryStrategy.SATISFY_PREREQUISITE.value
+    assert decision.state_updates.get("blocked_goal_action") == action
+    assert decision.state_updates.get("missing_prerequisites") == ["authenticated"]
 
 
 def test_decide_recovery_repeated_same_action_blocked_again_returns_replan():
@@ -284,5 +335,5 @@ def test_run_loop_recovery_trace_has_recovery_decision_on_policy_block():
     run_orchestrated_loop(env=mock_env, proposer=ProposeBookProposer(), run_logger=mock_logger, task_index=0, max_num_steps=5, domain="airline", use_recovery=True)
     recovery_events = [e for e in trace_events if e.get("module") == "recovery" and e.get("event_type") == "recovery_decision"]
     assert len(recovery_events) >= 1
-    # With max_num_steps=5, step 1 does not hit turn_limit_risk, so we get policy-block strategy (REPLAN for missing_user_id)
-    assert recovery_events[0].get("chosen_strategy") in ("REPLAN_FROM_STATE", "ASK_USER_CONFIRMATION")
+    # Policy block (e.g. missing_user_id) now uses SATISFY_PREREQUISITE; confirmation still uses ASK_USER_CONFIRMATION.
+    assert recovery_events[0].get("chosen_strategy") in ("REPLAN_FROM_STATE", "ASK_USER_CONFIRMATION", "SATISFY_PREREQUISITE")

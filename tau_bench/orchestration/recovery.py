@@ -13,6 +13,11 @@ from tau_bench.types import Action
 from tau_bench.orchestration.policy_guard import (
     AIRLINE_GUARDED_ACTIONS,
     CODE_MISSING_CONFIRMATION,
+    CODE_MISSING_ORDER_CONTEXT,
+    CODE_MISSING_PROFILE_GROUNDING,
+    CODE_MISSING_RESERVATION_CONTEXT,
+    CODE_MISSING_USER_ID,
+    CODE_NOT_AUTHENTICATED,
     CODE_SUBJECT_AMBIGUITY,
     RETAIL_GUARDED_ACTIONS,
 )
@@ -41,6 +46,7 @@ class RecoveryStrategy(str, Enum):
     RETRY_SAME_ACTION = "RETRY_SAME_ACTION"
     RETRY_REPAIRED_ACTION = "RETRY_REPAIRED_ACTION"
     ASK_USER_CONFIRMATION = "ASK_USER_CONFIRMATION"
+    SATISFY_PREREQUISITE = "SATISFY_PREREQUISITE"
     ASK_CLARIFYING_QUESTION = "ASK_CLARIFYING_QUESTION"
     REPLAN_FROM_STATE = "REPLAN_FROM_STATE"
     SWITCH_TOOL_OR_ACTION_TYPE = "SWITCH_TOOL_OR_ACTION_TYPE"
@@ -64,10 +70,58 @@ class RecoveryState:
     last_blocked_retry_key: Optional[str] = None
     # Last N last_action values for no-progress detection (Phase C)
     recent_last_actions: List[str] = field(default_factory=list)
+    # True when recovery is in a flow that requires user interaction (confirmation, clarification,
+    # missing slot, ambiguity resolution, etc.). Used so completion guard allows respond through
+    # to reach env and get a user turn; extend when adding ASK_CLARIFYING_QUESTION, slot prompts, etc.
+    awaiting_user_input: bool = False
+    # When set, the orchestrator replays this action on the same step (instead of calling the proposer).
+    # Current semantics: a blocked side-effect action becomes eligible again after user confirmation;
+    # we store it here so the run loop can re-execute it deterministically.
+    #
+    # Future generalization: other recovery types may need different retry semantics (e.g. clarification
+    # may require patching arguments; entity disambiguation may require rewriting action inputs; tool
+    # failure may require an alternate action, not the same one). Consider a more general abstraction
+    # later, e.g. resume_action / recovery_resume_action / post_recovery_next_action, with optional
+    # "retry with update" when arguments could be stale, state changed, or user input should modify
+    # the action before retry. For confirmation-only flows, replaying the exact stored action is correct.
+    retry_action_after_confirmation: Optional[Action] = None
+    # Prerequisite-targeted recovery: when a mutating action is blocked for missing prerequisite(s),
+    # we store the blocked intent so planner can steer toward satisfying the prerequisite, then resume.
+    blocked_goal_action: Optional[Action] = None
+    missing_prerequisites: List[str] = field(default_factory=list)
+    resume_intent_after_prereq: bool = False
+    # When all prerequisites are satisfied, run_loop can set this to replay the blocked action (similar to confirmation).
+    retry_action_after_prereq: Optional[Action] = None
 
 
 def _default_side_effecting_tools() -> Set[str]:
     return set(AIRLINE_GUARDED_ACTIONS) | set(RETAIL_GUARDED_ACTIONS)
+
+
+# Policy block codes that indicate a missing prerequisite (not confirmation). Recovery records blocked intent
+# and steers next step toward satisfying the prerequisite before retrying the mutating action.
+PREREQUISITE_BLOCK_CODES = frozenset({
+    CODE_MISSING_USER_ID,
+    CODE_MISSING_PROFILE_GROUNDING,
+    CODE_NOT_AUTHENTICATED,
+    CODE_MISSING_RESERVATION_CONTEXT,
+    CODE_MISSING_ORDER_CONTEXT,
+})
+
+
+def _prereq_code_to_required_state(code: str, missing: List[str]) -> Dict[str, Any]:
+    """Map policy block code to a minimal required-state description for planner/run_loop."""
+    if code == CODE_MISSING_USER_ID:
+        return {"user_id": "established"}
+    if code == CODE_MISSING_PROFILE_GROUNDING:
+        return {"profile_grounded": True}
+    if code == CODE_NOT_AUTHENTICATED:
+        return {"authenticated": True}
+    if code == CODE_MISSING_RESERVATION_CONTEXT:
+        return {"reservation_context": "grounded"}
+    if code == CODE_MISSING_ORDER_CONTEXT:
+        return {"order_context": "grounded"}
+    return {"missing_prerequisites": missing}
 
 
 @dataclass(frozen=True)
@@ -206,8 +260,8 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
                 confidence=0.9,
                 recoverable=True,
                 proposed_strategy=RecoveryStrategy.REPLAN_FROM_STATE.value,
-                message_to_user="Resolve the target entity before mutating state if ambiguous (account owner, saved entity, or newly introduced entity).",
-                replanning_hint="Resolve who or what the action applies to before proceeding.",
+                message_to_user="Resolve the target entity before taking this action (account owner, saved entity, or newly introduced entity).",
+                replanning_hint="Resolve the action target before retrying; do not assume which entity the action applies to.",
                 retry_key=retry_key,
                 retry_budget_cost=1,
                 trace_metadata={**trace_metadata, "subject_ambiguity": True},
@@ -254,14 +308,46 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
                 retry_budget_cost=1,
                 trace_metadata={**trace_metadata, "confirmation_key": confirmation_key},
             )
-        # Other policy blocks -> REPLAN
+        # Prerequisite block (missing_user_id, missing_profile_grounding, not_authenticated, etc.)
+        # -> SATISFY_PREREQUISITE: record blocked intent so planner steers toward satisfying prerequisite.
+        if (
+            input_.source_code in PREREQUISITE_BLOCK_CODES
+            and action.name in config.side_effecting_tools
+        ):
+            missing = input_.missing_prerequisites or []
+            return RecoveryDecision(
+                failure_type=failure_type,
+                diagnosis=diagnosis,
+                confidence=0.9,
+                recoverable=True,
+                proposed_strategy=RecoveryStrategy.SATISFY_PREREQUISITE.value,
+                message_to_user=(
+                    "You must first establish the missing prerequisite before retrying the blocked action. "
+                    + (input_.source_message or "")
+                ),
+                state_updates={
+                    "blocked_goal_action": action,
+                    "missing_prerequisites": list(missing),
+                    "resume_intent_after_prereq": True,
+                    "next_required_state": _prereq_code_to_required_state(input_.source_code, missing),
+                },
+                replanning_hint=(
+                    "Next step: satisfy the missing prerequisite(s) (" + ", ".join(missing) + "), "
+                    "then retry the blocked mutating action. Do not repeat the same blocked action until the prerequisite is satisfied."
+                ),
+                retry_key=retry_key,
+                retry_budget_cost=1,
+                trace_metadata={**trace_metadata, "prerequisite_block": True, "missing_prereqs": missing},
+            )
+        # Other policy blocks -> REPLAN with recovery guidance
         return RecoveryDecision(
             failure_type=failure_type,
             diagnosis=diagnosis,
             confidence=0.8,
             recoverable=True,
             proposed_strategy=RecoveryStrategy.REPLAN_FROM_STATE.value,
-            replanning_hint="Reconsider last error and try a different approach.",
+            message_to_user="If a required state-changing action has not yet succeeded, do not claim completion. Recover from the last blocked or failed step. Resolve the target entity before retrying if ambiguous.",
+            replanning_hint="Reconsider last error; satisfy missing prerequisite or resolve target entity, then retry.",
             retry_key=retry_key,
             retry_budget_cost=1,
             trace_metadata=trace_metadata,
@@ -282,7 +368,7 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
             trace_metadata=trace_metadata,
         )
 
-    # Phase C: no_progress -> REPLAN or SAFE_TERMINATE
+    # Phase C: no_progress -> REPLAN
     if failure_type == FailureCategory.no_progress.value:
         diagnosis = "No progress: same action repeated without success."
         return RecoveryDecision(
@@ -291,13 +377,14 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
             confidence=0.9,
             recoverable=True,
             proposed_strategy=RecoveryStrategy.REPLAN_FROM_STATE.value,
+            message_to_user="Base progress on actual tool outcomes. Confirm completion only after successful execution is observed.",
             replanning_hint="Try a different action or approach; no progress detected.",
             retry_key=retry_key,
             retry_budget_cost=1,
             trace_metadata=trace_metadata,
         )
 
-    # Phase D: tool_execution_error -> ASK_CLARIFYING_QUESTION or REPLAN
+    # Phase D: tool_execution_error -> REPLAN with grounded guidance
     if failure_type == FailureCategory.tool_execution_error.value:
         diagnosis = f"Tool execution failed: {input_.tool_observation_summary or input_.source_message or 'unknown'}"
         return RecoveryDecision(
@@ -306,7 +393,8 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
             confidence=0.8,
             recoverable=True,
             proposed_strategy=RecoveryStrategy.REPLAN_FROM_STATE.value,
-            replanning_hint="Tool returned an error; try different arguments or another approach.",
+            message_to_user="Use actual tool outcomes to assess progress. A blocked or failed state-changing action means the task is still incomplete. Do not claim success until successful execution is observed.",
+            replanning_hint="Try different arguments or approach; treat this as incomplete and recover.",
             retry_key=retry_key,
             retry_budget_cost=1,
             trace_metadata={**trace_metadata, "tool_observation_summary": input_.tool_observation_summary},
@@ -322,7 +410,7 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
             recoverable=True,
             proposed_strategy=RecoveryStrategy.REPLAN_FROM_STATE.value,
             message_to_user=get_completion_guard_recovery_message(),
-            replanning_hint="Do not claim completion until the relevant action succeeds in the environment.",
+            replanning_hint="Do not finalize until the required state-changing action succeeds. Use actual tool outcomes, not conversational claims.",
             retry_key=retry_key,
             retry_budget_cost=1,
             trace_metadata=trace_metadata,
@@ -337,8 +425,8 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
             confidence=0.9,
             recoverable=True,
             proposed_strategy=RecoveryStrategy.REPLAN_FROM_STATE.value,
-            message_to_user="Resolve the target entity before mutating state if ambiguous (account owner, saved entity, or newly introduced entity).",
-            replanning_hint="Resolve who or what the action applies to before proceeding.",
+            message_to_user="Resolve the target entity before taking this action (account owner, saved entity, or newly introduced entity).",
+            replanning_hint="Resolve the action target before retrying; do not assume which entity the action applies to.",
             retry_key=retry_key,
             retry_budget_cost=1,
             trace_metadata=trace_metadata,
@@ -359,10 +447,10 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
 
 
 def get_completion_guard_recovery_message() -> str:
-    """Generic message injected when completion guard blocks a success-style respond."""
+    """Concise message injected when completion guard blocks a success-style respond. Generic for airline + retail."""
     return (
-        "A successful state-changing tool execution has not yet been observed. "
-        "Do not claim completion until the relevant action succeeds in the environment."
+        "No successful state-changing tool execution has been observed yet. "
+        "Do not confirm completion. Continue from the latest grounded state and complete the required action first."
     )
 
 

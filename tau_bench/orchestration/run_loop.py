@@ -2,18 +2,32 @@
 # Minimal orchestrator run loop: init/reset → proposer → validator → executor → state update → finish_run.
 # Only the orchestrator calls the logger.
 
+import json
 from typing import Any, Dict, List, Optional
 
 from tau_bench.envs.base import Env
-from tau_bench.orchestration.grounding import (
-    GROUNDED_COMPLETION_AND_SUBJECT_GUIDANCE,
-    apply_grounding,
-    build_grounded_facts_summary,
-)
+from tau_bench.orchestration.grounding import apply_grounding, build_grounded_facts_summary
 from tau_bench.orchestration.logging import observation_summary
+from tau_bench.orchestration.planner import build_planner_guidance_text, plan
 from tau_bench.orchestration.task_state import TaskState, create_initial_task_state
+
+
+def _is_prerequisite_satisfied(prereq: str, task_state: TaskState) -> bool:
+    """True if the given prerequisite name is satisfied by current task_state (for prerequisite recovery sync)."""
+    if prereq == "user_id":
+        return bool(task_state.identity.user_id and str(task_state.identity.user_id).strip())
+    if prereq == "profile_grounded":
+        return task_state.identity.profile_grounded
+    if prereq == "authenticated":
+        return task_state.identity.authenticated
+    if prereq in ("reservation_id", "reservation_context"):
+        return bool((task_state.grounded.get("reservation_ids") or []) or task_state.grounded.get("reservation_details"))
+    if prereq in ("order_id", "order_context"):
+        return bool((task_state.grounded.get("order_ids") or []) or task_state.grounded.get("order_details"))
+    return False
 from tau_bench.orchestration.tool_outcomes import (
     classify_observation,
+    is_explicit_completion_outcome_claim,
     is_mutating_tool,
     is_success_style_respond,
 )
@@ -32,6 +46,17 @@ from tau_bench.orchestration.recovery import (
     is_no_progress,
 )
 from tau_bench.types import Action, SolveResult, RESPOND_ACTION_NAME
+
+# Trust boundary: only genuine user/env-originated content uses role="user".
+# Orchestrator/recovery/planner/validator/policy-guard guidance uses this role and prefix.
+ORCHESTRATOR_GUIDANCE_ROLE = "system"
+ORCHESTRATOR_GUIDANCE_PREFIX = "[Runtime guidance] "
+
+
+def _runtime_guidance_message(content: str) -> Dict[str, Any]:
+    """Build a message for synthetic orchestrator guidance. Must not use role='user'."""
+    return {"role": ORCHESTRATOR_GUIDANCE_ROLE, "content": ORCHESTRATOR_GUIDANCE_PREFIX + content}
+
 
 # Logger protocol: has log_run_start, log_step_stage, write_trace_event, finish_run
 RunLogger = Any
@@ -60,7 +85,7 @@ def run_orchestrated_loop(
         obs = env_reset_res.observation
         info = env_reset_res.info.model_dump()
         messages = [
-            {"role": "system", "content": GROUNDED_COMPLETION_AND_SUBJECT_GUIDANCE + "\n\n" + env.wiki},
+            {"role": "system", "content": env.wiki},
             {"role": "user", "content": obs},
         ]
         task_state: TaskState = create_initial_task_state(
@@ -94,18 +119,26 @@ def run_orchestrated_loop(
                 "total_cost": total_cost,
                 "done": done,
             })
-            # Phase B: if pending side-effect and last message is from user, check confirmation and clear pending
-            if use_recovery and recovery_state.pending_side_effect_action is not None:
-                if messages and messages[-1].get("role") == "user":
-                    last_content = messages[-1].get("content")
-                    if isinstance(last_content, str) and recovery_state.pending_confirmation_key:
-                        if detect_confirmation_satisfied(
-                            last_content, recovery_state.pending_confirmation_key
-                        ):
-                            task_state.add_confirmation(recovery_state.pending_confirmation_key)
-                            recovery_state.pending_side_effect_action = None
-                            recovery_state.pending_confirmation_key = None
-                            recovery_state.pending_since_step = 0
+            # Phase B: if pending side-effect and the most recent user message indicates confirmation, clear pending and set retry
+            # Use the last message with role=="user" (scan from end) so we detect confirmation even if message order varies
+            if use_recovery and recovery_state.pending_side_effect_action is not None and recovery_state.pending_confirmation_key:
+                last_user_msg = None
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("role") == "user":
+                        last_user_msg = messages[i]
+                        break
+                if last_user_msg:
+                    last_content = last_user_msg.get("content")
+                    if isinstance(last_content, str) and detect_confirmation_satisfied(
+                        last_content, recovery_state.pending_confirmation_key
+                    ):
+                        task_state.add_confirmation(recovery_state.pending_confirmation_key)
+                        # Deterministic retry: re-execute the blocked action this step instead of relying on the proposer
+                        recovery_state.retry_action_after_confirmation = recovery_state.pending_side_effect_action
+                        recovery_state.pending_side_effect_action = None
+                        recovery_state.pending_confirmation_key = None
+                        recovery_state.pending_since_step = 0
+                        recovery_state.awaiting_user_input = False
             # Phase C: no-progress check at start of step
             if use_recovery and is_no_progress(recovery_state):
                 rec_input = RecoveryInput(
@@ -140,11 +173,77 @@ def run_orchestrated_loop(
                     return SolveResult(reward=reward, info=info, messages=messages, total_cost=total_cost)
             # Inject grounded facts summary so LLM can reason with "what we know" (no tool names in prompt)
             summary = build_grounded_facts_summary(task_state)
+            plan_result = plan(task_state, recovery_state, step_index, max_num_steps)
+            plan_text = build_planner_guidance_text(plan_result)
+            run_logger.write_trace_event({
+                "step_index": step_index,
+                "module": "planner",
+                "event_type": "planner_invoked",
+                "subgoal": plan_result.subgoal,
+                "preferred_next_action_type": plan_result.preferred_next_action_type,
+                "success_checkpoint": plan_result.success_checkpoint,
+                "replan_triggers": plan_result.replan_triggers,
+                "planning_notes": plan_result.planning_notes,
+            })
             for i in range(len(messages) - 1, -1, -1):
                 if "content" in messages[i] and isinstance(messages[i].get("content"), str):
-                    messages[i]["content"] = f"[{summary}]\n\n{messages[i]['content']}"
+                    messages[i]["content"] = f"[{summary}]\n[{plan_text}]\n\n{messages[i]['content']}"
                     break
-            next_message, action, cost = proposer.generate_next_step(messages)
+            # Deterministic retry after confirmation: replay the stored action instead of calling the proposer.
+            # For confirmation-only flows, the stored action is still valid at retry time (no state change
+            # or user input that should modify it). For future recovery types (clarification, disambiguation,
+            # tool failure), consider validating or updating the action before retry (e.g. stale arguments,
+            # schema refresh, or "retry with update" from recovered user input).
+            if use_recovery and recovery_state.retry_action_after_confirmation is not None:
+                action = recovery_state.retry_action_after_confirmation
+                retry_id = f"retry-{step_index}-{action.name}"
+                next_message = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": retry_id,
+                            "type": "function",
+                            "function": {
+                                "name": action.name,
+                                "arguments": json.dumps(action.kwargs) if action.kwargs else "{}",
+                            },
+                        }
+                    ],
+                }
+                cost = 0.0
+                recovery_state.retry_action_after_confirmation = None
+                run_logger.write_trace_event({
+                    "step_index": step_index,
+                    "module": "orchestrator",
+                    "event_type": "retry_after_confirmation",
+                    "action_name": action.name,
+                })
+            elif use_recovery and recovery_state.retry_action_after_prereq is not None:
+                action = recovery_state.retry_action_after_prereq
+                retry_id = f"retry-prereq-{step_index}-{action.name}"
+                next_message = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": retry_id,
+                            "type": "function",
+                            "function": {
+                                "name": action.name,
+                                "arguments": json.dumps(action.kwargs) if action.kwargs else "{}",
+                            },
+                        }
+                    ],
+                }
+                cost = 0.0
+                recovery_state.retry_action_after_prereq = None
+                run_logger.write_trace_event({
+                    "step_index": step_index,
+                    "module": "orchestrator",
+                    "event_type": "retry_after_prereq",
+                    "action_name": action.name,
+                })
+            else:
+                next_message, action, cost = proposer.generate_next_step(messages)
             total_cost += cost
             # Proposer stage (log + trace)
             run_logger.log_step_stage(
@@ -219,7 +318,7 @@ def run_orchestrated_loop(
                         },
                     ])
                 else:
-                    messages.extend([next_message, {"role": "user", "content": rejection}])
+                    messages.extend([next_message, _runtime_guidance_message(rejection)])
                 last_action = action.name
                 last_observation_summary = observation_summary(rejection)
                 steps = step_index
@@ -272,8 +371,18 @@ def run_orchestrated_loop(
                             recovery_state.pending_side_effect_action = su["set_pending_side_effect_action"]
                             recovery_state.pending_confirmation_key = su.get("pending_confirmation_key") or "booking_confirmed"
                             recovery_state.pending_since_step = step_index
+                            recovery_state.awaiting_user_input = True
                         if rec_decision.message_to_user:
                             rejection = rejection + "\n\n" + rec_decision.message_to_user
+                    # Prerequisite-targeted recovery: carry blocked intent so planner can steer next step
+                    if rec_decision.proposed_strategy == "SATISFY_PREREQUISITE":
+                        su = rec_decision.state_updates
+                        if "blocked_goal_action" in su:
+                            recovery_state.blocked_goal_action = su["blocked_goal_action"]
+                            recovery_state.missing_prerequisites = list(su.get("missing_prerequisites") or [])
+                            recovery_state.resume_intent_after_prereq = bool(su.get("resume_intent_after_prereq", True))
+                        if rec_decision.replanning_hint:
+                            rejection = rejection + "\n\n" + rec_decision.replanning_hint
                     run_logger.write_trace_event({
                         "step_index": step_index,
                         "module": "recovery",
@@ -301,7 +410,7 @@ def run_orchestrated_loop(
                         },
                     ])
                 else:
-                    messages.extend([next_message, {"role": "user", "content": rejection}])
+                    messages.extend([next_message, _runtime_guidance_message(rejection)])
                 last_action = action.name
                 last_observation_summary = observation_summary(rejection)
                 steps = step_index
@@ -309,15 +418,25 @@ def run_orchestrated_loop(
                     recovery_state.last_blocked_retry_key = action_retry_key(action)
                     recovery_state.recent_last_actions = (recovery_state.recent_last_actions + [action.name])[-3:]
                 continue
-            # Completion guard: block success-style respond when no grounded mutation success
+            # Completion guard: block success-style respond when no grounded mutation success.
+            # Allow through when recovery is awaiting user input (confirmation, clarification, etc.)
+            # so the respond reaches env and we get a user turn—except block explicit outcome claims
+            # (e.g. "Your booking is confirmed") even during that flow.
             if action.name == RESPOND_ACTION_NAME and use_recovery:
                 content = (action.kwargs or {}).get("content") or ""
                 if is_success_style_respond(content):
                     pending = recovery_state.pending_side_effect_action if use_recovery else None
                     requires_grounded = task_state.requires_grounded_completion(pending)
-                    if requires_grounded and len(task_state.successful_mutations) == 0:
+                    awaiting_user = recovery_state.awaiting_user_input
+                    explicit_outcome_claim = is_explicit_completion_outcome_claim(content)
+                    block = (
+                        requires_grounded
+                        and len(task_state.successful_mutations) == 0
+                        and (not awaiting_user or explicit_outcome_claim)
+                    )
+                    if block:
                         recovery_message = get_completion_guard_recovery_message()
-                        messages.extend([next_message, {"role": "user", "content": recovery_message}])
+                        messages.extend([next_message, _runtime_guidance_message(recovery_message)])
                         recovery_state.recovery_count_this_run += 1
                         run_logger.write_trace_event({
                             "step_index": step_index,
@@ -398,6 +517,25 @@ def run_orchestrated_loop(
                     env_response.observation,
                     task_state,
                 )
+                # Prerequisite satisfaction: if we had a blocked mutating goal, drop now-satisfied prereqs;
+                # when all are satisfied, schedule deterministic retry of the blocked action next step.
+                if use_recovery and recovery_state.blocked_goal_action is not None and recovery_state.missing_prerequisites:
+                    still_missing = [
+                        p for p in recovery_state.missing_prerequisites
+                        if not _is_prerequisite_satisfied(p, task_state)
+                    ]
+                    recovery_state.missing_prerequisites = still_missing
+                    if not still_missing:
+                        next_retry_action = recovery_state.blocked_goal_action
+                        recovery_state.retry_action_after_prereq = next_retry_action
+                        recovery_state.blocked_goal_action = None
+                        recovery_state.resume_intent_after_prereq = False
+                        run_logger.write_trace_event({
+                            "step_index": step_index,
+                            "module": "orchestrator",
+                            "event_type": "prereq_satisfied_retry_scheduled",
+                            "action_name": next_retry_action.name if next_retry_action else None,
+                        })
 
             last_action = action.name
             last_observation_summary = obs_summary
@@ -408,6 +546,7 @@ def run_orchestrated_loop(
                 if action_retry_key(action) == action_retry_key(recovery_state.pending_side_effect_action):
                     recovery_state.pending_side_effect_action = None
                     recovery_state.pending_confirmation_key = None
+                    recovery_state.awaiting_user_input = False
             if use_recovery:
                 recovery_state.recent_last_actions = (recovery_state.recent_last_actions + [action.name])[-3:]
 

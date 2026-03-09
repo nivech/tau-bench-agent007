@@ -73,6 +73,31 @@ _SUCCESS_PHRASES = (
     "your order",
 )
 
+# Phrases that claim the task/booking/order is already done (outcome claim). When recovery is
+# awaiting_user_input we still block these so the assistant cannot falsely claim completion.
+_EXPLICIT_OUTCOME_CLAIM_PHRASES = (
+    "your booking is confirmed",
+    "your order is confirmed",
+    "reservation is confirmed",
+    "booking is confirmed",
+    "order is complete",
+    "order completed",
+    "booking confirmed",
+    "reservation confirmed",
+)
+
+
+def is_explicit_completion_outcome_claim(content: str) -> bool:
+    """
+    True if the respond content explicitly claims the task/booking/order is already done.
+    Used to block false completion claims even when recovery is awaiting user input;
+    confirmation-seeking text ("Please confirm...", "Reply yes to confirm") is allowed through.
+    """
+    if not content or not isinstance(content, str):
+        return False
+    text = content.strip().lower()
+    return any(phrase in text for phrase in _EXPLICIT_OUTCOME_CLAIM_PHRASES)
+
 
 def is_success_style_respond(content: str) -> bool:
     """
