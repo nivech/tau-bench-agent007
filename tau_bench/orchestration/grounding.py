@@ -4,6 +4,15 @@
 # Supports airline and retail; only authoritative tool results are grounded.
 
 import json
+
+# Generic agent guidance for grounded completion and subject resolution (airline + retail).
+# Prepended to system/wiki in run_loop so the model sees it once per run.
+GROUNDED_COMPLETION_AND_SUBJECT_GUIDANCE = """## Grounded completion and subject resolution
+- Never claim a state-changing task is complete based only on conversation text. Only confirm completion after a real tool execution succeeds in the environment.
+- If a tool was blocked or failed, treat the task as incomplete and recover; do not tell the user the action succeeded.
+- Resolve who or what the action is for before state-changing operations: distinguish account/profile owner, previously saved related entities, and newly introduced entities from the current conversation. If ambiguous, ask or infer only when grounded evidence supports it.
+- When policy or instructions say you must "obtain" something (e.g. user id, reservation id, order id, payment method), ground that by either: (1) using a value already in task state or from a prior successful tool result, or (2) looking it up via the appropriate tool, or (3) asking the user to provide it. Never hallucinate or invent ids or other identifiers; only use values the user has given or that tools have returned.
+"""
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tau_bench.envs.base import Env
@@ -215,4 +224,9 @@ def build_grounded_facts_summary(task_state: TaskState) -> str:
     elif task_state.domain == "retail":
         oids = task_state.grounded.get("order_ids") or []
         parts.append(f"order_ids={oids}")
+    # Hint when a state-changing action was attempted but has not yet succeeded
+    if len(task_state.attempted_mutating_tools) > 0 and len(task_state.successful_mutations) == 0:
+        parts.append("Note: A state-changing action has not yet succeeded; do not claim completion until it does.")
+    if task_state.subject_resolution_status == "ambiguous":
+        parts.append("Note: Resolve the target entity before mutating (account owner, saved entity, or new entity).")
     return "Grounded facts: " + "; ".join(parts)

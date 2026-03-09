@@ -67,6 +67,14 @@ class TaskState:
     last_error: Optional[str] = None
     scratchpad_summary: Optional[str] = None
     domain_state: Dict[str, Any] = field(default_factory=dict)
+    # Grounded completion guard: only real env.step(tool) successes count
+    last_tool_action: Optional[str] = None
+    last_tool_observation: Optional[str] = None
+    successful_mutations: List[str] = field(default_factory=list)  # tool names that ran and succeeded
+    attempted_mutating_tools: Set[str] = field(default_factory=set)  # mutating tools attempted this run
+    # Subject resolution: target entity (account owner, saved entity, new entity)
+    resolved_subject_entities: Dict[str, Any] = field(default_factory=dict)
+    subject_resolution_status: Optional[str] = None  # e.g. "resolved", "ambiguous", None
 
     def set_user_id(self, user_id: str) -> None:
         self.identity.user_id = user_id
@@ -102,12 +110,32 @@ class TaskState:
 
     def update_after_step(self, action_name: str, observation: str) -> None:
         """Update last_tool_result / last_error from executor observation."""
+        self.last_tool_action = action_name
+        self.last_tool_observation = observation
         if observation.strip().startswith("Error:"):
             self.last_error = observation
             self.last_tool_result = None
         else:
             self.last_tool_result = observation
             self.last_error = None
+
+    def record_mutating_attempt(self, tool_name: str) -> None:
+        """Record that a mutating tool was attempted (blocked or about to run)."""
+        self.attempted_mutating_tools.add(tool_name)
+
+    def record_successful_mutation(self, tool_name: str) -> None:
+        """Record that a mutating tool was executed and returned non-error."""
+        if tool_name not in self.successful_mutations:
+            self.successful_mutations.append(tool_name)
+
+    def requires_grounded_completion(self, pending_side_effect_action: Any = None) -> bool:
+        """
+        True if the task expects a state-changing tool success but we have not seen one.
+        Caller can pass recovery_state.pending_side_effect_action to include pending.
+        """
+        if pending_side_effect_action is not None:
+            return True
+        return len(self.attempted_mutating_tools) > 0 and len(self.successful_mutations) == 0
 
 
 def _default_domain_state(domain: str) -> Dict[str, Any]:

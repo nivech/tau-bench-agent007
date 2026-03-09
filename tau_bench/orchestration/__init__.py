@@ -24,6 +24,20 @@ from tau_bench.orchestration.task_state import (
 from tau_bench.orchestration.validator import ValidatorResult, validate_action
 from tau_bench.orchestration.policy_guard import PolicyGuardResult, check_policy
 from tau_bench.orchestration.grounding import apply_grounding, build_grounded_facts_summary
+from tau_bench.orchestration.recovery import (
+    FailureCategory,
+    RecoveryConfig,
+    RecoveryDecision,
+    RecoveryInput,
+    RecoveryState,
+    RecoveryStrategy,
+    action_retry_key,
+    default_recovery_config,
+    decide_recovery,
+    detect_confirmation_satisfied,
+    get_completion_guard_recovery_message,
+    is_no_progress,
+)
 
 __all__ = [
     "create_run_logger",
@@ -46,4 +60,16 @@ __all__ = [
     "check_policy",
     "apply_grounding",
     "build_grounded_facts_summary",
+    "FailureCategory",
+    "RecoveryConfig",
+    "RecoveryDecision",
+    "RecoveryInput",
+    "RecoveryState",
+    "RecoveryStrategy",
+    "action_retry_key",
+    "default_recovery_config",
+    "decide_recovery",
+    "detect_confirmation_satisfied",
+    "get_completion_guard_recovery_message",
+    "is_no_progress",
 ]

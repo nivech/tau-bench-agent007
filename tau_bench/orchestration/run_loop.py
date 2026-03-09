@@ -5,11 +5,32 @@
 from typing import Any, Dict, List, Optional
 
 from tau_bench.envs.base import Env
-from tau_bench.orchestration.grounding import apply_grounding, build_grounded_facts_summary
+from tau_bench.orchestration.grounding import (
+    GROUNDED_COMPLETION_AND_SUBJECT_GUIDANCE,
+    apply_grounding,
+    build_grounded_facts_summary,
+)
 from tau_bench.orchestration.logging import observation_summary
 from tau_bench.orchestration.task_state import TaskState, create_initial_task_state
+from tau_bench.orchestration.tool_outcomes import (
+    classify_observation,
+    is_mutating_tool,
+    is_success_style_respond,
+)
 from tau_bench.orchestration.validator import ValidatorResult, validate_action
-from tau_bench.orchestration.policy_guard import PolicyGuardResult, check_policy
+from tau_bench.orchestration.policy_guard import CODE_SUBJECT_AMBIGUITY, PolicyGuardResult, check_policy
+from tau_bench.orchestration.recovery import (
+    FailureCategory,
+    RecoveryConfig,
+    RecoveryInput,
+    RecoveryState,
+    action_retry_key,
+    default_recovery_config,
+    decide_recovery,
+    detect_confirmation_satisfied,
+    get_completion_guard_recovery_message,
+    is_no_progress,
+)
 from tau_bench.types import Action, SolveResult, RESPOND_ACTION_NAME
 
 # Logger protocol: has log_run_start, log_step_stage, write_trace_event, finish_run
@@ -23,6 +44,7 @@ def run_orchestrated_loop(
     task_index: Optional[int],
     max_num_steps: int,
     domain: Optional[str] = None,
+    use_recovery: bool = True,
 ) -> SolveResult:
     """Run one task: reset → start log → loop (propose → validate → execute → state update) → finish_run.
     TaskState is created at entry and updated each step for policy guard, planner, recovery, etc."""
@@ -32,12 +54,13 @@ def run_orchestrated_loop(
     num_validation_failures = 0
     info: Dict[str, Any] = {}
     messages: List[Dict[str, Any]] = []
+    recovery_state: Optional[RecoveryState] = None
     try:
         env_reset_res = env.reset(task_index=task_index)
         obs = env_reset_res.observation
         info = env_reset_res.info.model_dump()
         messages = [
-            {"role": "system", "content": env.wiki},
+            {"role": "system", "content": GROUNDED_COMPLETION_AND_SUBJECT_GUIDANCE + "\n\n" + env.wiki},
             {"role": "user", "content": obs},
         ]
         task_state: TaskState = create_initial_task_state(
@@ -45,6 +68,8 @@ def run_orchestrated_loop(
             task=env.task,
             initial_observation=obs,
         )
+        recovery_state = RecoveryState()
+        recovery_config = default_recovery_config(domain or "airline")
         run_logger.log_run_start()
         first_event = {
             "step_index": 0,
@@ -69,6 +94,50 @@ def run_orchestrated_loop(
                 "total_cost": total_cost,
                 "done": done,
             })
+            # Phase B: if pending side-effect and last message is from user, check confirmation and clear pending
+            if use_recovery and recovery_state.pending_side_effect_action is not None:
+                if messages and messages[-1].get("role") == "user":
+                    last_content = messages[-1].get("content")
+                    if isinstance(last_content, str) and recovery_state.pending_confirmation_key:
+                        if detect_confirmation_satisfied(
+                            last_content, recovery_state.pending_confirmation_key
+                        ):
+                            task_state.add_confirmation(recovery_state.pending_confirmation_key)
+                            recovery_state.pending_side_effect_action = None
+                            recovery_state.pending_confirmation_key = None
+                            recovery_state.pending_since_step = 0
+            # Phase C: no-progress check at start of step
+            if use_recovery and is_no_progress(recovery_state):
+                rec_input = RecoveryInput(
+                    failure_type="no_progress",
+                    action=Action(name=RESPOND_ACTION_NAME, kwargs={"content": ""}),
+                    step_index=step_index,
+                    max_num_steps=max_num_steps,
+                    recovery_state=recovery_state,
+                    last_action=last_action,
+                )
+                rec_decision = decide_recovery(rec_input, recovery_config)
+                recovery_state.recovery_count_this_run += rec_decision.retry_budget_cost
+                run_logger.write_trace_event({
+                    "step_index": step_index,
+                    "module": "recovery",
+                    "event_type": "recovery_decision",
+                    "failure_trigger": rec_decision.failure_type,
+                    "diagnosis": rec_decision.diagnosis,
+                    "chosen_strategy": rec_decision.proposed_strategy,
+                    **rec_decision.trace_metadata,
+                    "recovery_count_this_run": recovery_state.recovery_count_this_run,
+                })
+                if rec_decision.terminal_reason:
+                    run_logger.finish_run(
+                        exit_reason="recovery_terminated",
+                        steps=steps,
+                        total_cost=total_cost,
+                        reward=reward,
+                        done=False,
+                        counters={"num_validation_failures": num_validation_failures, "num_recovery_invocations": recovery_state.recovery_count_this_run},
+                    )
+                    return SolveResult(reward=reward, info=info, messages=messages, total_cost=total_cost)
             # Inject grounded facts summary so LLM can reason with "what we know" (no tool names in prompt)
             summary = build_grounded_facts_summary(task_state)
             for i in range(len(messages) - 1, -1, -1):
@@ -109,6 +178,35 @@ def run_orchestrated_loop(
             if not v_result.allowed:
                 num_validation_failures += 1
                 rejection = f"Validation failed: {v_result.message}"
+                if use_recovery:
+                    rec_input = RecoveryInput(
+                        failure_type=FailureCategory.validation_error.value,
+                        action=action,
+                        step_index=step_index,
+                        max_num_steps=max_num_steps,
+                        source_code=v_result.code,
+                        source_message=v_result.message,
+                        domain=task_state.domain,
+                        recovery_state=recovery_state,
+                        last_action=last_action,
+                    )
+                    rec_decision = decide_recovery(rec_input, recovery_config)
+                    recovery_state.recovery_count_this_run += rec_decision.retry_budget_cost
+                    run_logger.write_trace_event({
+                        "step_index": step_index,
+                        "module": "recovery",
+                        "event_type": "recovery_decision",
+                        "failure_trigger": rec_decision.failure_type,
+                        "failure_code": rec_decision.trace_metadata.get("failure_code"),
+                        "diagnosis": rec_decision.diagnosis,
+                        "chosen_strategy": rec_decision.proposed_strategy,
+                        "retry_key": rec_decision.retry_key,
+                        "retry_allowed": rec_decision.retry_allowed,
+                        "retry_budget_cost": rec_decision.retry_budget_cost,
+                        "terminal_reason": rec_decision.terminal_reason,
+                        **rec_decision.trace_metadata,
+                        "recovery_count_this_run": recovery_state.recovery_count_this_run,
+                    })
                 if action.name != RESPOND_ACTION_NAME and "tool_calls" in next_message and next_message.get("tool_calls"):
                     next_message["tool_calls"] = next_message["tool_calls"][:1]
                     messages.extend([
@@ -125,6 +223,8 @@ def run_orchestrated_loop(
                 last_action = action.name
                 last_observation_summary = observation_summary(rejection)
                 steps = step_index
+                if use_recovery:
+                    recovery_state.recent_last_actions = (recovery_state.recent_last_actions + [last_action])[-3:]
                 continue
             # Policy guard stage (after validator, before executor)
             p_result: PolicyGuardResult = check_policy(env, action, task_state)
@@ -145,6 +245,50 @@ def run_orchestrated_loop(
             if not p_result.allowed:
                 rejection = f"Policy blocked: {p_result.message}"
                 task_state.set_last_error(f"Policy blocked ({p_result.code}): {p_result.message}")
+                if p_result.code == CODE_SUBJECT_AMBIGUITY:
+                    task_state.subject_resolution_status = "ambiguous"
+                # Record that a mutating tool was attempted (so completion guard knows task expects mutation)
+                if is_mutating_tool(task_state.domain, action.name):
+                    task_state.record_mutating_attempt(action.name)
+                if use_recovery:
+                    rec_input = RecoveryInput(
+                        failure_type=FailureCategory.policy_block.value,
+                        action=action,
+                        step_index=step_index,
+                        max_num_steps=max_num_steps,
+                        source_code=p_result.code,
+                        source_message=p_result.message,
+                        missing_prerequisites=p_result.missing_prerequisites,
+                        domain=task_state.domain,
+                        recovery_state=recovery_state,
+                        last_action=last_action,
+                    )
+                    rec_decision = decide_recovery(rec_input, recovery_config)
+                    recovery_state.recovery_count_this_run += rec_decision.retry_budget_cost
+                    # Phase B: apply ASK_USER_CONFIRMATION state updates
+                    if rec_decision.proposed_strategy == "ASK_USER_CONFIRMATION":
+                        su = rec_decision.state_updates
+                        if "set_pending_side_effect_action" in su:
+                            recovery_state.pending_side_effect_action = su["set_pending_side_effect_action"]
+                            recovery_state.pending_confirmation_key = su.get("pending_confirmation_key") or "booking_confirmed"
+                            recovery_state.pending_since_step = step_index
+                        if rec_decision.message_to_user:
+                            rejection = rejection + "\n\n" + rec_decision.message_to_user
+                    run_logger.write_trace_event({
+                        "step_index": step_index,
+                        "module": "recovery",
+                        "event_type": "recovery_decision",
+                        "failure_trigger": rec_decision.failure_type,
+                        "failure_code": rec_decision.trace_metadata.get("failure_code"),
+                        "diagnosis": rec_decision.diagnosis,
+                        "chosen_strategy": rec_decision.proposed_strategy,
+                        "retry_key": rec_decision.retry_key,
+                        "retry_allowed": rec_decision.retry_allowed,
+                        "retry_budget_cost": rec_decision.retry_budget_cost,
+                        "terminal_reason": rec_decision.terminal_reason,
+                        **rec_decision.trace_metadata,
+                        "recovery_count_this_run": recovery_state.recovery_count_this_run,
+                    })
                 if action.name != RESPOND_ACTION_NAME and "tool_calls" in next_message and next_message.get("tool_calls"):
                     next_message["tool_calls"] = next_message["tool_calls"][:1]
                     messages.extend([
@@ -161,7 +305,33 @@ def run_orchestrated_loop(
                 last_action = action.name
                 last_observation_summary = observation_summary(rejection)
                 steps = step_index
+                if use_recovery:
+                    recovery_state.last_blocked_retry_key = action_retry_key(action)
+                    recovery_state.recent_last_actions = (recovery_state.recent_last_actions + [action.name])[-3:]
                 continue
+            # Completion guard: block success-style respond when no grounded mutation success
+            if action.name == RESPOND_ACTION_NAME and use_recovery:
+                content = (action.kwargs or {}).get("content") or ""
+                if is_success_style_respond(content):
+                    pending = recovery_state.pending_side_effect_action if use_recovery else None
+                    requires_grounded = task_state.requires_grounded_completion(pending)
+                    if requires_grounded and len(task_state.successful_mutations) == 0:
+                        recovery_message = get_completion_guard_recovery_message()
+                        messages.extend([next_message, {"role": "user", "content": recovery_message}])
+                        recovery_state.recovery_count_this_run += 1
+                        run_logger.write_trace_event({
+                            "step_index": step_index,
+                            "module": "completion_guard",
+                            "event_type": "completion_guard_blocked",
+                            "recovery_count_this_run": recovery_state.recovery_count_this_run,
+                        })
+                        last_action = RESPOND_ACTION_NAME
+                        last_observation_summary = observation_summary(recovery_message)
+                        steps = step_index
+                        continue
+            # Record mutating attempt when we are about to execute a mutating tool (policy already allowed)
+            if action.name != RESPOND_ACTION_NAME and is_mutating_tool(task_state.domain, action.name):
+                task_state.record_mutating_attempt(action.name)
             env_response = env.step(action)
             reward = env_response.reward
             info = {**info, **env_response.info.model_dump()}
@@ -184,6 +354,41 @@ def run_orchestrated_loop(
             run_logger.write_trace_event(trace_evt)
 
             task_state.update_after_step(action.name, env_response.observation)
+            # Record successful mutation when a mutating tool ran and returned non-error (real env.step result only)
+            if action.name != RESPOND_ACTION_NAME:
+                outcome = classify_observation(
+                    task_state.domain,
+                    action.name,
+                    env_response.observation,
+                )
+                if outcome.is_mutating and outcome.execution_succeeded:
+                    task_state.record_successful_mutation(action.name)
+            # Phase D: tool execution error recovery
+            if use_recovery and env_response.observation.strip().startswith("Error:"):
+                rec_input = RecoveryInput(
+                    failure_type="tool_execution_error",
+                    action=action,
+                    step_index=step_index,
+                    max_num_steps=max_num_steps,
+                    source_message=env_response.observation[:500],
+                    tool_observation_summary=obs_summary,
+                    domain=task_state.domain,
+                    recovery_state=recovery_state,
+                    last_action=last_action,
+                )
+                rec_decision = decide_recovery(rec_input, recovery_config)
+                recovery_state.recovery_count_this_run += rec_decision.retry_budget_cost
+                run_logger.write_trace_event({
+                    "step_index": step_index,
+                    "module": "recovery",
+                    "event_type": "recovery_decision",
+                    "failure_trigger": rec_decision.failure_type,
+                    "diagnosis": rec_decision.diagnosis,
+                    "chosen_strategy": rec_decision.proposed_strategy,
+                    "retry_key": rec_decision.retry_key,
+                    **rec_decision.trace_metadata,
+                    "recovery_count_this_run": recovery_state.recovery_count_this_run,
+                })
             # Grounding only for env tool steps, not for terminal respond actions.
             if action.name != RESPOND_ACTION_NAME:
                 apply_grounding(
@@ -197,6 +402,14 @@ def run_orchestrated_loop(
             last_action = action.name
             last_observation_summary = obs_summary
             done = env_response.done
+
+            # Phase B: after successful execution, clear pending if this was the pending side-effect action
+            if use_recovery and recovery_state.pending_side_effect_action is not None:
+                if action_retry_key(action) == action_retry_key(recovery_state.pending_side_effect_action):
+                    recovery_state.pending_side_effect_action = None
+                    recovery_state.pending_confirmation_key = None
+            if use_recovery:
+                recovery_state.recent_last_actions = (recovery_state.recent_last_actions + [action.name])[-3:]
 
             if action.name != RESPOND_ACTION_NAME:
                 next_message["tool_calls"] = next_message["tool_calls"][:1]
@@ -226,7 +439,10 @@ def run_orchestrated_loop(
                     total_cost=total_cost,
                     reward=reward,
                     done=True,
-                    counters={"num_validation_failures": num_validation_failures},
+                    counters={
+                        "num_validation_failures": num_validation_failures,
+                        "num_recovery_invocations": recovery_state.recovery_count_this_run,
+                    },
                 )
                 return SolveResult(
                     reward=reward,
@@ -241,7 +457,10 @@ def run_orchestrated_loop(
             total_cost=total_cost,
             reward=reward,
             done=False,
-            counters={"num_validation_failures": num_validation_failures},
+            counters={
+                "num_validation_failures": num_validation_failures,
+                "num_recovery_invocations": recovery_state.recovery_count_this_run,
+            },
         )
         return SolveResult(
             reward=reward,
@@ -256,6 +475,10 @@ def run_orchestrated_loop(
             total_cost=total_cost,
             reward=reward,
             done=False,
-            counters={"error": 1, "num_validation_failures": num_validation_failures},
+            counters={
+                "error": 1,
+                "num_validation_failures": num_validation_failures,
+                "num_recovery_invocations": recovery_state.recovery_count_this_run if recovery_state else 0,
+            },
         )
         raise
