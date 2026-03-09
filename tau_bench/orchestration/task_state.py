@@ -53,7 +53,12 @@ class TaskState:
     """
     Shared orchestration state per run/session. One instance per run_orchestrated_loop.
     Read/updated by proposer, planner, policy guard, validator, executor, recovery, memory.
+
+    Grounded state (identity, grounded dict, domain_state) is the source of truth for
+    building executable mutation args. PendingIntent metadata and proposer drafts are
+    treated as untrusted hints and must not override grounded values.
     """
+
     domain: str
     intent: IntentState = field(default_factory=IntentState)
     identity: IdentityState = field(default_factory=IdentityState)
@@ -75,6 +80,9 @@ class TaskState:
     # Subject resolution: target entity (account owner, saved entity, new entity)
     resolved_subject_entities: Dict[str, Any] = field(default_factory=dict)
     subject_resolution_status: Optional[str] = None  # e.g. "resolved", "ambiguous", None
+    # Last executed mutating action for observability / confirmation fingerprinting.
+    last_mutating_action_summary: Optional[str] = None
+    last_mutating_action_fingerprint: Optional[str] = None
 
     def set_user_id(self, user_id: str) -> None:
         self.identity.user_id = user_id
@@ -127,6 +135,20 @@ class TaskState:
         """Record that a mutating tool was executed and returned non-error."""
         if tool_name not in self.successful_mutations:
             self.successful_mutations.append(tool_name)
+
+    def set_last_mutating_action_summary(
+        self,
+        summary: str,
+        fingerprint: Optional[str] = None,
+    ) -> None:
+        """
+        Record a canonical summary (and optional fingerprint) of the most recent
+        mutating action that was prepared for execution. Used for logging and
+        confirmation reconciliation; not used as executable truth.
+        """
+        self.last_mutating_action_summary = summary
+        if fingerprint is not None:
+            self.last_mutating_action_fingerprint = fingerprint
 
     def requires_grounded_completion(self, pending_side_effect_action: Any = None) -> bool:
         """

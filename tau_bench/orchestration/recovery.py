@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 
 from tau_bench.types import Action
+from tau_bench.orchestration.pending_intent import PendingIntent, pending_intent_from_policy_block
 
 # Import policy guard constants for side-effecting tools and confirmation key
 from tau_bench.orchestration.policy_guard import (
@@ -62,6 +63,7 @@ class RecoveryState:
     """Mutable recovery state carried alongside TaskState in the run loop."""
     retry_counts: Dict[str, int] = field(default_factory=dict)
     failure_type_counts: Dict[str, int] = field(default_factory=dict)
+    # Deprecated: use pending_intent for new logic. Kept for backward compatibility with logs.
     pending_side_effect_action: Optional[Action] = None
     pending_confirmation_key: Optional[str] = None
     pending_since_step: int = 0
@@ -75,24 +77,20 @@ class RecoveryState:
     # missing slot, ambiguity resolution, etc.). Used so completion guard allows respond through
     # to reach env and get a user turn; extend when adding ASK_CLARIFYING_QUESTION, slot prompts, etc.
     awaiting_user_input: bool = False
-    # When set, the orchestrator replays this action on the same step (instead of calling the proposer).
-    # Current semantics: a blocked side-effect action becomes eligible again after user confirmation;
-    # we store it here so the run loop can re-execute it deterministically.
-    #
-    # Future generalization: other recovery types may need different retry semantics (e.g. clarification
-    # may require patching arguments; entity disambiguation may require rewriting action inputs; tool
-    # failure may require an alternate action, not the same one). Consider a more general abstraction
-    # later, e.g. resume_action / recovery_resume_action / post_recovery_next_action, with optional
-    # "retry with update" when arguments could be stale, state changed, or user input should modify
-    # the action before retry. For confirmation-only flows, replaying the exact stored action is correct.
+    # Pending mutating intent and retry flags. This replaces the older pattern of
+    # storing raw Action objects for replay (retry_action_after_*). The orchestrator
+    # uses PendingIntent together with an ActionArgumentBuilder to rebuild fresh,
+    # grounded kwargs from TaskState before execution.
+    pending_intent: Optional[PendingIntent] = None
+    retry_intent_after_confirmation: bool = False
+    retry_intent_after_prereq: bool = False
+    # Deprecated retry hooks kept for compatibility with existing tests and logs.
     retry_action_after_confirmation: Optional[Action] = None
-    # Prerequisite-targeted recovery: when a mutating action is blocked for missing prerequisite(s),
-    # we store the blocked intent so planner can steer toward satisfying the prerequisite, then resume.
+    retry_action_after_prereq: Optional[Action] = None
+    # Prerequisite-targeted recovery (deprecated fields kept for compatibility with logs/tests).
     blocked_goal_action: Optional[Action] = None
     missing_prerequisites: List[str] = field(default_factory=list)
     resume_intent_after_prereq: bool = False
-    # When all prerequisites are satisfied, run_loop can set this to replay the blocked action (similar to confirmation).
-    retry_action_after_prereq: Optional[Action] = None
 
 
 def _default_side_effecting_tools() -> Set[str]:
@@ -267,7 +265,9 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
                 retry_budget_cost=1,
                 trace_metadata={**trace_metadata, "subject_ambiguity": True},
             )
-        # Same retry_key blocked again while we already have a pending action -> repeated_same_action
+        # Same retry_key blocked again while we already have a pending side-effect action
+        # -> repeated_same_action. This preserves existing behavior relied on by tests and
+        # keeps REPLAN guidance when the model keeps retrying without asking for confirmation.
         if recovery_state.pending_side_effect_action is not None:
             pending_key = action_retry_key(recovery_state.pending_side_effect_action)
             if retry_key == pending_key:
@@ -292,6 +292,15 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
                 if input_.missing_prerequisites
                 else "booking_confirmed"
             )
+            # Create or update a PendingIntent for this mutating action. The intent
+            # captures the goal and unresolved confirmation requirement; the action
+            # kwargs remain untrusted draft metadata.
+            pending = pending_intent_from_policy_block(
+                action,
+                input_.missing_prerequisites or [confirmation_key],
+                created_step=step_index,
+                existing=recovery_state.pending_intent,
+            )
             return RecoveryDecision(
                 failure_type=failure_type,
                 diagnosis=diagnosis,
@@ -300,7 +309,10 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
                 proposed_strategy=RecoveryStrategy.ASK_USER_CONFIRMATION.value,
                 message_to_user="Please confirm you want to proceed with this action.",
                 state_updates={
+                    # Backwards-compatible fields:
                     "set_pending_side_effect_action": action,
+                    # New intent-based representation:
+                    "pending_intent": pending,
                     "pending_confirmation_key": confirmation_key,
                     "pending_since_step": step_index,
                 },
@@ -316,6 +328,12 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
             and action.name in config.side_effecting_tools
         ):
             missing = input_.missing_prerequisites or []
+            pending = pending_intent_from_policy_block(
+                action,
+                missing,
+                created_step=step_index,
+                existing=recovery_state.pending_intent,
+            )
             return RecoveryDecision(
                 failure_type=failure_type,
                 diagnosis=diagnosis,
@@ -327,9 +345,12 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
                     + (input_.source_message or "")
                 ),
                 state_updates={
+                    # Backwards-compatible fields:
                     "blocked_goal_action": action,
                     "missing_prerequisites": list(missing),
                     "resume_intent_after_prereq": True,
+                    # New intent-based representation:
+                    "pending_intent": pending,
                     "next_required_state": _prereq_code_to_required_state(input_.source_code, missing),
                 },
                 replanning_hint=(
