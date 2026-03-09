@@ -10,6 +10,15 @@ from tau_bench.orchestration.grounding import apply_grounding, build_grounded_fa
 from tau_bench.orchestration.logging import observation_summary
 from tau_bench.orchestration.planner import build_planner_guidance_text, plan
 from tau_bench.orchestration.task_state import TaskState, create_initial_task_state
+from tau_bench.orchestration.action_args_builder import (
+    ActionArgumentBuilder,
+    ActionBuildError,
+    get_default_builder,
+)
+from tau_bench.orchestration.confirmation import (
+    summarize_mutating_action,
+    fingerprint_action_summary,
+)
 
 
 def _is_prerequisite_satisfied(prereq: str, task_state: TaskState) -> bool:
@@ -120,6 +129,7 @@ def run_orchestrated_loop(
         )
         recovery_state = RecoveryState()
         recovery_config = default_recovery_config(domain or "airline")
+        builder: ActionArgumentBuilder = get_default_builder()
         run_logger.log_run_start()
         first_event = {
             "step_index": 0,
@@ -145,9 +155,16 @@ def run_orchestrated_loop(
                 "total_cost": total_cost,
                 "done": done,
             })
-            # Phase B: if pending side-effect and the most recent user message indicates confirmation, clear pending and set retry
-            # Use the last message with role=="user" (scan from end) so we detect confirmation even if message order varies
-            if use_recovery and recovery_state.pending_side_effect_action is not None and recovery_state.pending_confirmation_key:
+            # Phase B: if there is a pending confirmation and the most recent user message
+            # indicates confirmation, record it. Execution of the intent happens later via
+            # builder-driven retry; we do not replay stored kwargs directly.
+            # Use the last message with role=="user" (scan from end) so we detect confirmation
+            # even if message order varies.
+            if (
+                use_recovery
+                and recovery_state.pending_confirmation_key
+                and (recovery_state.pending_intent is not None or recovery_state.pending_side_effect_action is not None)
+            ):
                 last_user_msg = None
                 for i in range(len(messages) - 1, -1, -1):
                     if messages[i].get("role") == "user":
@@ -159,9 +176,15 @@ def run_orchestrated_loop(
                         last_content, recovery_state.pending_confirmation_key
                     ):
                         task_state.add_confirmation(recovery_state.pending_confirmation_key)
-                        # Deterministic retry: re-execute the blocked action this step instead of relying on the proposer
-                        recovery_state.retry_action_after_confirmation = recovery_state.pending_side_effect_action
-                        recovery_state.pending_side_effect_action = None
+                        # Mark pending intent (if any) as user-confirmed so the builder-driven
+                        # retry path can execute a fresh, grounded action.
+                        if recovery_state.pending_intent is not None:
+                            recovery_state.pending_intent.user_confirmed = True
+                            recovery_state.retry_intent_after_confirmation = True
+                        # Legacy hook for compatibility: when only pending_side_effect_action
+                        # is set, older code paths can still replay via retry_action_after_confirmation.
+                        if recovery_state.pending_side_effect_action is not None:
+                            recovery_state.retry_action_after_confirmation = recovery_state.pending_side_effect_action
                         recovery_state.pending_confirmation_key = None
                         recovery_state.pending_since_step = 0
                         recovery_state.awaiting_user_input = False
@@ -216,59 +239,103 @@ def run_orchestrated_loop(
                 if "content" in messages[i] and isinstance(messages[i].get("content"), str):
                     messages[i]["content"] = f"[{summary}]\n[{plan_text}]\n\n{messages[i]['content']}"
                     break
-            # Deterministic retry after confirmation: replay the stored action instead of calling the proposer.
-            # For confirmation-only flows, the stored action is still valid at retry time (no state change
-            # or user input that should modify it). For future recovery types (clarification, disambiguation,
-            # tool failure), consider validating or updating the action before retry (e.g. stale arguments,
-            # schema refresh, or "retry with update" from recovered user input).
-            if use_recovery and recovery_state.retry_action_after_confirmation is not None:
-                action = recovery_state.retry_action_after_confirmation
-                retry_id = f"retry-{step_index}-{action.name}"
-                next_message = {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": retry_id,
-                            "type": "function",
-                            "function": {
-                                "name": action.name,
-                                "arguments": json.dumps(action.kwargs) if action.kwargs else "{}",
-                            },
+            # Deterministic retry after confirmation or after satisfying prerequisites now uses the
+            # pending intent plus the ActionArgumentBuilder (introduced in a separate module) to
+            # construct fresh grounded kwargs from TaskState. We no longer replay stored kwargs.
+            #
+            # The actual argument-building and Action construction is handled in the builder layer.
+            # Here we just detect that a retry should occur and delegate to the proposer path when
+            # no deterministic retry is set.
+            if use_recovery and recovery_state.retry_intent_after_confirmation and recovery_state.pending_intent is not None:
+                intent = recovery_state.pending_intent
+                action_name = intent.action_name
+                try:
+                    built = builder.build_action_args(action_name, task_state, intent)
+                except ActionBuildError as e:
+                    # If we cannot safely build kwargs, fall back to planner/proposer with guidance.
+                    recovery_state.retry_intent_after_confirmation = False
+                    messages.append(_runtime_guidance_message(str(e)))
+                    next_message, action, cost = proposer.generate_next_step(messages)
+                else:
+                    summary = summarize_mutating_action(action_name, built.kwargs, task_state)
+                    fingerprint = fingerprint_action_summary(summary)
+                    # If a fingerprint was previously confirmed and state has changed, require reconfirmation.
+                    if intent.confirmation_fingerprint is not None and intent.confirmation_fingerprint != fingerprint:
+                        intent.user_confirmed = False
+                        intent.confirmation_fingerprint = fingerprint
+                        task_state.set_last_mutating_action_summary(summary, fingerprint)
+                        recovery_state.retry_intent_after_confirmation = False
+                        # Ask for confirmation again with updated summary.
+                        messages.append(
+                            _runtime_guidance_message(
+                                "The pending action has changed since your last confirmation; "
+                                "reconfirm the latest action details before proceeding."
+                            )
+                        )
+                        next_message, action, cost = proposer.generate_next_step(messages)
+                    else:
+                        intent.user_confirmed = True
+                        intent.confirmation_fingerprint = fingerprint
+                        task_state.set_last_mutating_action_summary(summary, fingerprint)
+                        action = Action(name=action_name, kwargs=built.kwargs)
+                        retry_id = f"retry-{step_index}-{action.name}"
+                        next_message = {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": retry_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": action.name,
+                                        "arguments": json.dumps(action.kwargs) if action.kwargs else "{}",
+                                    },
+                                }
+                            ],
                         }
-                    ],
-                }
-                cost = 0.0
-                recovery_state.retry_action_after_confirmation = None
-                run_logger.write_trace_event({
-                    "step_index": step_index,
-                    "module": "orchestrator",
-                    "event_type": "retry_after_confirmation",
-                    "action_name": action.name,
-                })
-            elif use_recovery and recovery_state.retry_action_after_prereq is not None:
-                action = recovery_state.retry_action_after_prereq
-                retry_id = f"retry-prereq-{step_index}-{action.name}"
-                next_message = {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": retry_id,
-                            "type": "function",
-                            "function": {
-                                "name": action.name,
-                                "arguments": json.dumps(action.kwargs) if action.kwargs else "{}",
-                            },
-                        }
-                    ],
-                }
-                cost = 0.0
-                recovery_state.retry_action_after_prereq = None
-                run_logger.write_trace_event({
-                    "step_index": step_index,
-                    "module": "orchestrator",
-                    "event_type": "retry_after_prereq",
-                    "action_name": action.name,
-                })
+                        cost = 0.0
+                        recovery_state.retry_intent_after_confirmation = False
+                        run_logger.write_trace_event({
+                            "step_index": step_index,
+                            "module": "orchestrator",
+                            "event_type": "retry_after_confirmation",
+                            "action_name": action.name,
+                        })
+            elif use_recovery and recovery_state.retry_intent_after_prereq and recovery_state.pending_intent is not None:
+                intent = recovery_state.pending_intent
+                action_name = intent.action_name
+                try:
+                    built = builder.build_action_args(action_name, task_state, intent)
+                except ActionBuildError as e:
+                    recovery_state.retry_intent_after_prereq = False
+                    messages.append(_runtime_guidance_message(str(e)))
+                    next_message, action, cost = proposer.generate_next_step(messages)
+                else:
+                    summary = summarize_mutating_action(action_name, built.kwargs, task_state)
+                    fingerprint = fingerprint_action_summary(summary)
+                    task_state.set_last_mutating_action_summary(summary, fingerprint)
+                    action = Action(name=action_name, kwargs=built.kwargs)
+                    retry_id = f"retry-prereq-{step_index}-{action.name}"
+                    next_message = {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": retry_id,
+                                "type": "function",
+                                "function": {
+                                    "name": action.name,
+                                    "arguments": json.dumps(action.kwargs) if action.kwargs else "{}",
+                                },
+                            }
+                        ],
+                    }
+                    cost = 0.0
+                    recovery_state.retry_intent_after_prereq = False
+                    run_logger.write_trace_event({
+                        "step_index": step_index,
+                        "module": "orchestrator",
+                        "event_type": "retry_after_prereq",
+                        "action_name": action.name,
+                    })
             else:
                 try:
                     next_message, action, cost = proposer.generate_next_step(messages)
@@ -444,6 +511,8 @@ def run_orchestrated_loop(
                             recovery_state.pending_confirmation_key = su.get("pending_confirmation_key") or "booking_confirmed"
                             recovery_state.pending_since_step = step_index
                             recovery_state.awaiting_user_input = True
+                        if "pending_intent" in su and su["pending_intent"] is not None:
+                            recovery_state.pending_intent = su["pending_intent"]
                         if rec_decision.message_to_user:
                             rejection = rejection + "\n\n" + rec_decision.message_to_user
                     # Prerequisite-targeted recovery: carry blocked intent so planner can steer next step
@@ -453,6 +522,8 @@ def run_orchestrated_loop(
                             recovery_state.blocked_goal_action = su["blocked_goal_action"]
                             recovery_state.missing_prerequisites = list(su.get("missing_prerequisites") or [])
                             recovery_state.resume_intent_after_prereq = bool(su.get("resume_intent_after_prereq", True))
+                        if "pending_intent" in su and su["pending_intent"] is not None:
+                            recovery_state.pending_intent = su["pending_intent"]
                         if rec_decision.replanning_hint:
                             rejection = rejection + "\n\n" + rec_decision.replanning_hint
                     run_logger.write_trace_event({
@@ -579,22 +650,20 @@ def run_orchestrated_loop(
                 )
                 # Prerequisite satisfaction: if we had a blocked mutating goal, drop now-satisfied prereqs;
                 # when all are satisfied, schedule deterministic retry of the blocked action next step.
-                if use_recovery and recovery_state.blocked_goal_action is not None and recovery_state.missing_prerequisites:
+                if use_recovery and recovery_state.pending_intent is not None and recovery_state.missing_prerequisites:
                     still_missing = [
                         p for p in recovery_state.missing_prerequisites
                         if not _is_prerequisite_satisfied(p, task_state)
                     ]
                     recovery_state.missing_prerequisites = still_missing
                     if not still_missing:
-                        next_retry_action = recovery_state.blocked_goal_action
-                        recovery_state.retry_action_after_prereq = next_retry_action
-                        recovery_state.blocked_goal_action = None
+                        recovery_state.retry_intent_after_prereq = True
                         recovery_state.resume_intent_after_prereq = False
                         run_logger.write_trace_event({
                             "step_index": step_index,
                             "module": "orchestrator",
                             "event_type": "prereq_satisfied_retry_scheduled",
-                            "action_name": next_retry_action.name if next_retry_action else None,
+                            "action_name": recovery_state.pending_intent.action_name if recovery_state.pending_intent else None,
                         })
 
             last_action = action.name
