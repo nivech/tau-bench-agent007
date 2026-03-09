@@ -58,8 +58,33 @@ def _runtime_guidance_message(content: str) -> Dict[str, Any]:
     return {"role": ORCHESTRATOR_GUIDANCE_ROLE, "content": ORCHESTRATOR_GUIDANCE_PREFIX + content}
 
 
+def _append_rejection_to_messages(
+    messages: List[Dict[str, Any]],
+    next_message: Dict[str, Any],
+    action: Action,
+    rejection: str,
+) -> None:
+    """Append rejection to messages (validator or policy block path). Tool-calling format: assistant + tool message with rejection; else next_message + system guidance."""
+    if action.name != RESPOND_ACTION_NAME and "tool_calls" in next_message and next_message.get("tool_calls"):
+        next_message = {**next_message, "tool_calls": next_message["tool_calls"][:1]}
+        messages.extend([
+            next_message,
+            {
+                "role": "tool",
+                "tool_call_id": next_message["tool_calls"][0]["id"],
+                "name": next_message["tool_calls"][0]["function"]["name"],
+                "content": rejection,
+            },
+        ])
+    else:
+        messages.extend([next_message, _runtime_guidance_message(rejection)])
+
+
 # Logger protocol: has log_run_start, log_step_stage, write_trace_event, finish_run
 RunLogger = Any
+
+# Cap on consecutive proposer failures before terminating the run.
+MAX_CONSECUTIVE_PROPOSER_FAILURES = 3
 
 
 def run_orchestrated_loop(
@@ -106,6 +131,7 @@ def run_orchestrated_loop(
         last_action: Optional[str] = None
         last_observation_summary: str = observation_summary(obs)
         done = False
+        consecutive_proposer_failures = 0
 
         for step_index in range(1, max_num_steps + 1):
             # Lightweight state snapshot at beginning of step (no full message history)
@@ -171,7 +197,8 @@ def run_orchestrated_loop(
                         counters={"num_validation_failures": num_validation_failures, "num_recovery_invocations": recovery_state.recovery_count_this_run},
                     )
                     return SolveResult(reward=reward, info=info, messages=messages, total_cost=total_cost)
-            # Inject grounded facts summary so LLM can reason with "what we know" (no tool names in prompt)
+            # Inject grounded facts summary and planner guidance into the last message with string content.
+            # Only that message's content is prepended; tool-calling format (roles, tool_calls) is preserved.
             summary = build_grounded_facts_summary(task_state)
             plan_result = plan(task_state, recovery_state, step_index, max_num_steps)
             plan_text = build_planner_guidance_text(plan_result)
@@ -243,7 +270,64 @@ def run_orchestrated_loop(
                     "action_name": action.name,
                 })
             else:
-                next_message, action, cost = proposer.generate_next_step(messages)
+                try:
+                    next_message, action, cost = proposer.generate_next_step(messages)
+                    consecutive_proposer_failures = 0
+                except Exception as e:  # noqa: BLE001
+                    run_logger.write_trace_event({
+                        "step_index": step_index,
+                        "module": "proposer",
+                        "event_type": "proposer_exception",
+                        "error": str(e),
+                    })
+                    rejection = f"Proposer failed: {e!s}"
+                    next_message = {"role": "assistant", "content": ""}
+                    action = Action(name=RESPOND_ACTION_NAME, kwargs={"content": ""})
+                    cost = 0.0
+                    if use_recovery:
+                        rec_input = RecoveryInput(
+                            failure_type=FailureCategory.proposer_error.value,
+                            action=action,
+                            step_index=step_index,
+                            max_num_steps=max_num_steps,
+                            source_message=str(e),
+                            domain=task_state.domain,
+                            recovery_state=recovery_state,
+                            last_action=last_action,
+                        )
+                        rec_decision = decide_recovery(rec_input, recovery_config)
+                        recovery_state.recovery_count_this_run += rec_decision.retry_budget_cost
+                        run_logger.write_trace_event({
+                            "step_index": step_index,
+                            "module": "recovery",
+                            "event_type": "recovery_decision",
+                            "failure_trigger": rec_decision.failure_type,
+                            "diagnosis": rec_decision.diagnosis,
+                            "chosen_strategy": rec_decision.proposed_strategy,
+                            **rec_decision.trace_metadata,
+                            "recovery_count_this_run": recovery_state.recovery_count_this_run,
+                        })
+                    _append_rejection_to_messages(messages, next_message, action, rejection)
+                    last_action = "proposer_error"
+                    last_observation_summary = observation_summary(rejection)
+                    steps = step_index
+                    consecutive_proposer_failures += 1
+                    if use_recovery:
+                        recovery_state.recent_last_actions = (recovery_state.recent_last_actions + [last_action])[-3:]
+                    if consecutive_proposer_failures >= MAX_CONSECUTIVE_PROPOSER_FAILURES:
+                        run_logger.finish_run(
+                            exit_reason="proposer_repeated_failure",
+                            steps=steps,
+                            total_cost=total_cost,
+                            reward=reward,
+                            done=False,
+                            counters={
+                                "num_validation_failures": num_validation_failures,
+                                "num_recovery_invocations": recovery_state.recovery_count_this_run,
+                            },
+                        )
+                        return SolveResult(reward=reward, info=info, messages=messages, total_cost=total_cost)
+                    continue
             total_cost += cost
             # Proposer stage (log + trace)
             run_logger.log_step_stage(
@@ -306,19 +390,7 @@ def run_orchestrated_loop(
                         **rec_decision.trace_metadata,
                         "recovery_count_this_run": recovery_state.recovery_count_this_run,
                     })
-                if action.name != RESPOND_ACTION_NAME and "tool_calls" in next_message and next_message.get("tool_calls"):
-                    next_message["tool_calls"] = next_message["tool_calls"][:1]
-                    messages.extend([
-                        next_message,
-                        {
-                            "role": "tool",
-                            "tool_call_id": next_message["tool_calls"][0]["id"],
-                            "name": next_message["tool_calls"][0]["function"]["name"],
-                            "content": rejection,
-                        },
-                    ])
-                else:
-                    messages.extend([next_message, _runtime_guidance_message(rejection)])
+                _append_rejection_to_messages(messages, next_message, action, rejection)
                 last_action = action.name
                 last_observation_summary = observation_summary(rejection)
                 steps = step_index
@@ -398,19 +470,7 @@ def run_orchestrated_loop(
                         **rec_decision.trace_metadata,
                         "recovery_count_this_run": recovery_state.recovery_count_this_run,
                     })
-                if action.name != RESPOND_ACTION_NAME and "tool_calls" in next_message and next_message.get("tool_calls"):
-                    next_message["tool_calls"] = next_message["tool_calls"][:1]
-                    messages.extend([
-                        next_message,
-                        {
-                            "role": "tool",
-                            "tool_call_id": next_message["tool_calls"][0]["id"],
-                            "name": next_message["tool_calls"][0]["function"]["name"],
-                            "content": rejection,
-                        },
-                    ])
-                else:
-                    messages.extend([next_message, _runtime_guidance_message(rejection)])
+                _append_rejection_to_messages(messages, next_message, action, rejection)
                 last_action = action.name
                 last_observation_summary = observation_summary(rejection)
                 steps = step_index
@@ -418,9 +478,9 @@ def run_orchestrated_loop(
                     recovery_state.last_blocked_retry_key = action_retry_key(action)
                     recovery_state.recent_last_actions = (recovery_state.recent_last_actions + [action.name])[-3:]
                 continue
-            # Completion guard: block success-style respond when no grounded mutation success.
-            # Allow through when recovery is awaiting user input (confirmation, clarification, etc.)
-            # so the respond reaches env and we get a user turn—except block explicit outcome claims
+            # Completion guard: reward 1.0 requires real env.step(tool) success, not assistant wording.
+            # Block success-style respond when no grounded mutation success. Allow through when recovery
+            # is awaiting user input (confirmation, clarification)—except block explicit outcome claims
             # (e.g. "Your booking is confirmed") even during that flow.
             if action.name == RESPOND_ACTION_NAME and use_recovery:
                 content = (action.kwargs or {}).get("content") or ""

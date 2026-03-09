@@ -35,6 +35,24 @@ def test_recovery_state_defaults():
     assert state.retry_action_after_prereq is None
 
 
+def test_decide_recovery_proposer_error_returns_replan():
+    """For proposer_error, decide_recovery returns REPLAN_FROM_STATE with message_to_user."""
+    action = Action(name="respond", kwargs={"content": ""})
+    rec_input = RecoveryInput(
+        failure_type=FailureCategory.proposer_error.value,
+        action=action,
+        step_index=1,
+        max_num_steps=30,
+        source_message="model timeout",
+    )
+    config = default_recovery_config("airline")
+    decision = decide_recovery(rec_input, config)
+    assert decision.proposed_strategy == RecoveryStrategy.REPLAN_FROM_STATE.value
+    assert "Proposer failed" in decision.diagnosis
+    assert decision.message_to_user is not None
+    assert decision.recoverable is True
+
+
 def test_decide_recovery_validation_error_returns_replan():
     """For validation_error, decide_recovery returns REPLAN_FROM_STATE (Phase A stub)."""
     action = Action(name="unknown_tool", kwargs={})
@@ -337,3 +355,221 @@ def test_run_loop_recovery_trace_has_recovery_decision_on_policy_block():
     assert len(recovery_events) >= 1
     # Policy block (e.g. missing_user_id) now uses SATISFY_PREREQUISITE; confirmation still uses ASK_USER_CONFIRMATION.
     assert recovery_events[0].get("chosen_strategy") in ("REPLAN_FROM_STATE", "ASK_USER_CONFIRMATION", "SATISFY_PREREQUISITE")
+
+
+def test_proposer_exception_recovery():
+    """Proposer raises; orchestrator catches, logs proposer_exception, appends error, does not crash; finish_run called."""
+    from unittest.mock import MagicMock
+    from tau_bench.types import Task
+    from tau_bench.orchestration.run_loop import run_orchestrated_loop
+
+    trace_events = []
+    finish_run_calls = []
+    mock_logger = MagicMock()
+    mock_logger.write_trace_event = lambda e: trace_events.append(e)
+    mock_logger.log_run_start = MagicMock()
+    mock_logger.log_step_stage = MagicMock()
+    mock_logger.finish_run = lambda **kw: finish_run_calls.append(kw)
+
+    mock_env = MagicMock()
+    mock_env.wiki = "# Policy"
+    mock_env.task = Task(user_id="u1", actions=[], instruction="Book flight", outputs=[])
+    mock_env.tools_map = {"get_user_details": None}
+    mock_env.tools_info = [
+        {"type": "function", "function": {"name": "get_user_details", "parameters": {"type": "object", "properties": {"user_id": {"type": "string"}}, "required": ["user_id"]}}},
+    ]
+    mock_env.reset.return_value = MagicMock(observation="Book a flight", info=MagicMock(model_dump=lambda: {}))
+    mock_env.step.return_value = MagicMock(observation="ok", reward=0.0, done=False, info=MagicMock(model_dump=lambda: {}))
+
+    class ProposerThatRaises:
+        def generate_next_step(self, messages):
+            raise RuntimeError("model timeout")
+
+    result = run_orchestrated_loop(
+        env=mock_env,
+        proposer=ProposerThatRaises(),
+        run_logger=mock_logger,
+        task_index=0,
+        max_num_steps=5,
+        domain="airline",
+        use_recovery=True,
+    )
+    proposer_exception_events = [e for e in trace_events if e.get("event_type") == "proposer_exception"]
+    assert len(proposer_exception_events) >= 1, "Expected at least one proposer_exception trace event"
+    assert "model timeout" in (proposer_exception_events[0].get("error") or "")
+    assert len(finish_run_calls) == 1, "finish_run must be called exactly once"
+    assert result.reward == 0.0
+    assert result.messages is not None
+
+
+def test_proposer_repeated_failure_terminates_run():
+    """Proposer raises repeatedly; after MAX_CONSECUTIVE_PROPOSER_FAILURES, finish_run(proposer_repeated_failure) and return."""
+    from unittest.mock import MagicMock
+    from tau_bench.types import Task
+    from tau_bench.orchestration.run_loop import run_orchestrated_loop
+
+    finish_run_calls = []
+    mock_logger = MagicMock()
+    mock_logger.write_trace_event = MagicMock()
+    mock_logger.log_run_start = MagicMock()
+    mock_logger.log_step_stage = MagicMock()
+    mock_logger.finish_run = lambda **kw: finish_run_calls.append(kw)
+
+    mock_env = MagicMock()
+    mock_env.wiki = "# Policy"
+    mock_env.task = Task(user_id="u1", actions=[], instruction="Book flight", outputs=[])
+    mock_env.tools_map = {}
+    mock_env.tools_info = []
+    mock_env.reset.return_value = MagicMock(observation="Hi", info=MagicMock(model_dump=lambda: {}))
+
+    class ProposerAlwaysRaises:
+        def generate_next_step(self, messages):
+            raise ValueError("bad response")
+
+    result = run_orchestrated_loop(
+        env=mock_env,
+        proposer=ProposerAlwaysRaises(),
+        run_logger=mock_logger,
+        task_index=0,
+        max_num_steps=10,
+        domain="airline",
+        use_recovery=True,
+    )
+    assert len(finish_run_calls) == 1
+    assert finish_run_calls[0].get("exit_reason") == "proposer_repeated_failure"
+    assert result.reward == 0.0
+
+
+def test_no_progress_triggers_recovery():
+    """Same action repeated 3 times (no progress) triggers recovery decision; run does not spin forever."""
+    from unittest.mock import MagicMock
+    from tau_bench.types import Task
+    from tau_bench.orchestration.run_loop import run_orchestrated_loop
+
+    trace_events = []
+    mock_logger = MagicMock()
+    mock_logger.write_trace_event = lambda e: trace_events.append(e)
+    mock_logger.log_run_start = MagicMock()
+    mock_logger.log_step_stage = MagicMock()
+    mock_logger.finish_run = MagicMock()
+
+    mock_env = MagicMock()
+    mock_env.wiki = "# Policy"
+    mock_env.task = Task(user_id="u1", actions=[], instruction="Get my profile", outputs=[])
+    mock_env.tools_map = {"get_user_details": None}
+    mock_env.tools_info = [
+        {"type": "function", "function": {"name": "get_user_details", "parameters": {"type": "object", "properties": {"user_id": {"type": "string"}}, "required": ["user_id"]}}},
+    ]
+    mock_env.reset.return_value = MagicMock(observation="Get my profile", info=MagicMock(model_dump=lambda: {}))
+
+    def mock_step(action):
+        return MagicMock(observation="{}", reward=0.0, done=False, info=MagicMock(model_dump=lambda: {}))
+
+    mock_env.step = mock_step
+
+    class ProposerSameToolThreeTimes:
+        def __init__(self):
+            self.call_count = 0
+
+        def generate_next_step(self, messages):
+            self.call_count += 1
+            return (
+                {"role": "assistant", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "get_user_details", "arguments": '{"user_id":"u1"}'}}]},
+                Action(name="get_user_details", kwargs={"user_id": "u1"}),
+                0.0,
+            )
+
+    result = run_orchestrated_loop(
+        env=mock_env,
+        proposer=ProposerSameToolThreeTimes(),
+        run_logger=mock_logger,
+        task_index=0,
+        max_num_steps=8,
+        domain="airline",
+        use_recovery=True,
+    )
+    no_progress_events = [e for e in trace_events if e.get("failure_trigger") == "no_progress"]
+    recovery_events = [e for e in trace_events if e.get("module") == "recovery" and e.get("event_type") == "recovery_decision"]
+    assert len(no_progress_events) >= 1 or len(recovery_events) >= 1, (
+        "Expected no_progress or recovery_decision. trace_events=%s" % [e.get("failure_trigger") or e.get("module") for e in trace_events]
+    )
+    assert result is not None
+
+
+def test_finish_run_called_with_correct_exit_reason():
+    """Success, budget_exhausted, and error paths each call finish_run with expected exit_reason."""
+    from unittest.mock import MagicMock
+    from tau_bench.types import Task, RESPOND_ACTION_NAME
+    from tau_bench.orchestration.run_loop import run_orchestrated_loop
+
+    mock_env = MagicMock()
+    mock_env.wiki = "# Policy"
+    mock_env.task = Task(user_id="u1", actions=[], instruction="Done", outputs=[])
+    mock_env.tools_map = {}
+    mock_env.tools_info = []
+    mock_env.reset.return_value = MagicMock(observation="Done", info=MagicMock(model_dump=lambda: {}))
+    mock_env.step.return_value = MagicMock(observation="Bye", reward=1.0, done=True, info=MagicMock(model_dump=lambda: {}))
+
+    finish_run_calls = []
+    mock_logger = MagicMock()
+    mock_logger.write_trace_event = MagicMock()
+    mock_logger.log_run_start = MagicMock()
+    mock_logger.log_step_stage = MagicMock()
+    mock_logger.finish_run = lambda **kw: finish_run_calls.append(kw)
+
+    class ProposerRespondDone:
+        def generate_next_step(self, messages):
+            return (
+                {"role": "assistant", "content": "Done."},
+                Action(name=RESPOND_ACTION_NAME, kwargs={"content": "Done."}),
+                0.0,
+            )
+
+    run_orchestrated_loop(
+        env=mock_env,
+        proposer=ProposerRespondDone(),
+        run_logger=mock_logger,
+        task_index=0,
+        max_num_steps=5,
+        domain="airline",
+        use_recovery=True,
+    )
+    assert len(finish_run_calls) == 1
+    assert finish_run_calls[0].get("exit_reason") == "success"
+
+    finish_run_calls_budget = []
+    mock_logger_budget = MagicMock()
+    mock_logger_budget.write_trace_event = MagicMock()
+    mock_logger_budget.log_run_start = MagicMock()
+    mock_logger_budget.log_step_stage = MagicMock()
+    mock_logger_budget.finish_run = lambda **kw: finish_run_calls_budget.append(kw)
+
+    mock_env_budget = MagicMock()
+    mock_env_budget.wiki = "# Policy"
+    mock_env_budget.task = Task(user_id="u1", actions=[], instruction="Task", outputs=[])
+    mock_env_budget.tools_map = {"get_user_details": None}
+    mock_env_budget.tools_info = [
+        {"type": "function", "function": {"name": "get_user_details", "parameters": {"type": "object", "properties": {"user_id": {"type": "string"}}, "required": ["user_id"]}}},
+    ]
+    mock_env_budget.reset.return_value = MagicMock(observation="Task", info=MagicMock(model_dump=lambda: {}))
+    mock_env_budget.step.return_value = MagicMock(observation="{}", reward=0.0, done=False, info=MagicMock(model_dump=lambda: {}))
+
+    class ProposerNeverDone:
+        def generate_next_step(self, messages):
+            return (
+                {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "get_user_details", "arguments": '{"user_id":"u1"}'}}]},
+                Action(name="get_user_details", kwargs={"user_id": "u1"}),
+                0.0,
+            )
+
+    run_orchestrated_loop(
+        env=mock_env_budget,
+        proposer=ProposerNeverDone(),
+        run_logger=mock_logger_budget,
+        task_index=0,
+        max_num_steps=2,
+        domain="airline",
+        use_recovery=True,
+    )
+    assert len(finish_run_calls_budget) == 1
+    assert finish_run_calls_budget[0].get("exit_reason") == "budget_exhausted"
