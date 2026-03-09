@@ -24,6 +24,13 @@ from tau_bench.orchestration.task_state import (
 from tau_bench.orchestration.validator import ValidatorResult, validate_action
 from tau_bench.orchestration.policy_guard import PolicyGuardResult, check_policy
 from tau_bench.orchestration.grounding import apply_grounding, build_grounded_facts_summary
+from tau_bench.orchestration.planner import (
+    PlanResult,
+    StepSpec,
+    StepType,
+    build_planner_guidance_text,
+    plan,
+)
 from tau_bench.orchestration.recovery import (
     FailureCategory,
     RecoveryConfig,
@@ -60,6 +67,11 @@ __all__ = [
     "check_policy",
     "apply_grounding",
     "build_grounded_facts_summary",
+    "PlanResult",
+    "StepSpec",
+    "StepType",
+    "build_planner_guidance_text",
+    "plan",
     "FailureCategory",
     "RecoveryConfig",
     "RecoveryDecision",
