@@ -39,6 +39,7 @@ class FailureCategory(str, Enum):
     budget_risk_or_turn_limit_risk = "budget_risk_or_turn_limit_risk"
     completion_guard_blocked = "completion_guard_blocked"
     subject_ambiguity = "subject_ambiguity"
+    proposer_error = "proposer_error"
 
 
 class RecoveryStrategy(str, Enum):
@@ -427,6 +428,22 @@ def decide_recovery(input_: RecoveryInput, config: RecoveryConfig) -> RecoveryDe
             proposed_strategy=RecoveryStrategy.REPLAN_FROM_STATE.value,
             message_to_user="Resolve the target entity before taking this action (account owner, saved entity, or newly introduced entity).",
             replanning_hint="Resolve the action target before retrying; do not assume which entity the action applies to.",
+            retry_key=retry_key,
+            retry_budget_cost=1,
+            trace_metadata=trace_metadata,
+        )
+
+    # Proposer exception: model call or message_to_action failed; replan so next step can retry.
+    if failure_type == FailureCategory.proposer_error.value:
+        diagnosis = f"Proposer failed: {input_.source_message or 'unknown error'}"
+        return RecoveryDecision(
+            failure_type=failure_type,
+            diagnosis=diagnosis,
+            confidence=0.8,
+            recoverable=True,
+            proposed_strategy=RecoveryStrategy.REPLAN_FROM_STATE.value,
+            message_to_user="The previous step could not produce a valid action. Continue from the latest state and try again.",
+            replanning_hint="Reconsider and produce a valid tool call or response.",
             retry_key=retry_key,
             retry_budget_cost=1,
             trace_metadata=trace_metadata,

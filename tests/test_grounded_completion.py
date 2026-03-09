@@ -811,6 +811,96 @@ def test_orchestrator_never_injects_synthetic_guidance_as_user():
     assert (last3.get("content") or "").startswith(ORCHESTRATOR_GUIDANCE_PREFIX)
 
 
+def test_successful_mutation_unlocks_completion():
+    """After real successful tool execution (e.g. book_reservation), success-style respond is allowed and run completes."""
+    from tau_bench.orchestration.run_loop import run_orchestrated_loop
+
+    step_calls = []
+    call_count = [0]
+
+    mock_logger = MagicMock()
+    mock_logger.write_trace_event = MagicMock()
+    mock_logger.log_run_start = MagicMock()
+    mock_logger.log_step_stage = MagicMock()
+    mock_logger.finish_run = MagicMock()
+
+    mock_env = MagicMock()
+    mock_env.wiki = "# Policy"
+    mock_env.task = Task(user_id="u1", actions=[], instruction="Book a flight", outputs=[])
+    mock_env.tools_map = {"get_user_details": None, "book_reservation": None}
+    mock_env.tools_info = [
+        {"type": "function", "function": {"name": "get_user_details", "parameters": {"type": "object", "properties": {"user_id": {"type": "string"}}, "required": ["user_id"]}}},
+        {"type": "function", "function": {"name": "book_reservation", "parameters": {"type": "object", "properties": {"user_id": {"type": "string"}}, "required": ["user_id"]}}},
+    ]
+    mock_env.reset.return_value = MagicMock(observation="Book a flight", info=MagicMock(model_dump=lambda: {}))
+
+    def mock_step(action):
+        step_calls.append(action.name)
+        if action.name == RESPOND_ACTION_NAME:
+            if "book_reservation" in step_calls:
+                return MagicMock(observation="Thank you", reward=1.0, done=True, info=MagicMock(model_dump=lambda: {}))
+            return MagicMock(observation="yes", reward=0.0, done=False, info=MagicMock(model_dump=lambda: {}))
+        if action.name == "get_user_details":
+            return MagicMock(
+                observation='{"payment_methods": {}, "dob": null, "membership": null, "reservations": [], "orders": []}',
+                reward=0.0,
+                done=False,
+                info=MagicMock(model_dump=lambda: {}),
+            )
+        if action.name == "book_reservation":
+            return MagicMock(observation='{"reservation_id": "R1"}', reward=0.0, done=False, info=MagicMock(model_dump=lambda: {}))
+        return MagicMock(observation="ok", reward=0.0, done=False, info=MagicMock(model_dump=lambda: {}))
+
+    mock_env.step = mock_step
+
+    class ProposerFullFlow:
+        def generate_next_step(self, messages):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (
+                    {"role": "assistant", "tool_calls": [{"id": "tc0", "function": {"name": "get_user_details", "arguments": '{"user_id":"u1"}'}}]},
+                    Action(name="get_user_details", kwargs={"user_id": "u1"}),
+                    0.0,
+                )
+            if call_count[0] == 2:
+                return (
+                    {"role": "assistant", "tool_calls": [{"id": "tc1", "function": {"name": "book_reservation", "arguments": '{"user_id":"u1"}'}}]},
+                    Action(name="book_reservation", kwargs={"user_id": "u1"}),
+                    0.0,
+                )
+            if call_count[0] == 3:
+                return (
+                    {"role": "assistant", "content": "Do you want to proceed? Reply yes to confirm."},
+                    Action(name=RESPOND_ACTION_NAME, kwargs={"content": "Do you want to proceed? Reply yes to confirm."}),
+                    0.0,
+                )
+            if call_count[0] >= 4:
+                return (
+                    {"role": "assistant", "content": "Your booking is confirmed. Reservation R1."},
+                    Action(name=RESPOND_ACTION_NAME, kwargs={"content": "Your booking is confirmed. Reservation R1."}),
+                    0.0,
+                )
+            return (
+                {"role": "assistant", "content": "Done."},
+                Action(name=RESPOND_ACTION_NAME, kwargs={"content": "Done."}),
+                0.0,
+            )
+
+    result = run_orchestrated_loop(
+        env=mock_env,
+        proposer=ProposerFullFlow(),
+        run_logger=mock_logger,
+        task_index=0,
+        max_num_steps=12,
+        domain="airline",
+        use_recovery=True,
+    )
+    assert "get_user_details" in step_calls
+    assert "book_reservation" in step_calls
+    assert step_calls.count(RESPOND_ACTION_NAME) >= 2, "Respond should be called at least twice (confirm prompt + final success)"
+    assert result.reward == 1.0
+
+
 def test_confirmation_detection_only_considers_genuine_user_messages():
     """When last message is synthetic (tool or system), confirmation must not be applied; only role='user' counts."""
     from tau_bench.orchestration.run_loop import run_orchestrated_loop
